@@ -63,7 +63,7 @@ if(NOT DEFINED PIPER_PHONEMIZE_DIR)
   ExternalProject_Add(
     piper_phonemize_external
     PREFIX "${CMAKE_CURRENT_BINARY_DIR}/p"
-    URL "https://github.com/rhasspy/piper-phonemize/archive/refs/heads/master.zip"
+    URL "https://github.com/binji/piper-phonemize/archive/refs/tags/2023-11-29.zip"
     CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${PIPER_PHONEMIZE_DIR} -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
   )
   add_dependencies(piper piper_phonemize_external)
