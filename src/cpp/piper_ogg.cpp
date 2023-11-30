@@ -1,67 +1,156 @@
+#include <fcntl.h>
+#include <stdio.h>
+
+#include <chrono>
+#include <cstdint>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <optional>
 #include <sstream>
-#include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
+
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
 #include "json.hpp"
 #include "piper.hpp"
 #include "minivorbis.h"
+#include "ThreadPool.h"
 
 using namespace std;
+using json = nlohmann::json;
+
+stringstream convertWavToOgg(piper::Voice &voice, const vector<int16_t> &input);
 
 int main(int argc, char *argv[]) {
+  spdlog::set_default_logger(spdlog::stderr_color_mt("piper_ogg"));
+  spdlog::set_level(spdlog::level::info);
   piper::PiperConfig piperConfig;
-  piper::Voice voice;
 
   if (argc < 2) {
-    std::cerr << "Need voice model path" << std::endl;
+    spdlog::error("Need espeak-ng-data path");
     return 1;
   }
 
-  if (argc < 3) {
-    std::cerr << "Need espeak-ng-data path" << std::endl;
-    return 1;
+  if (!_isatty(_fileno(stdout))) {
+    spdlog::info("Setting stdout to binary mode");
+    fflush(stdout);
+    _setmode(_fileno(stdout), _O_BINARY);
   }
 
-  if (argc < 4) {
-    std::cerr << "Need output WAV path" << std::endl;
-    return 1;
-  }
-
-  if (argc < 5) {
-    std::cerr << "Need input text" << std::endl;
-    return 1;
-  }
-
-  auto modelPath = std::string(argv[1]);
-  piperConfig.eSpeakDataPath = std::string(argv[2]);
-  auto outputPath = std::string(argv[3]);
-  auto inputText = std::string(argv[4]);
-
-  optional<piper::SpeakerId> speakerId;
-  loadVoice(piperConfig, modelPath, modelPath + ".json", voice, speakerId,
-            false);
+  piperConfig.eSpeakDataPath = string(argv[1]);
   piper::initialize(piperConfig);
 
-  if (voice.synthesisConfig.sampleWidth != 2) {
-    std::cerr << "ERROR: expected sample width to be 2" << std::endl;
-    return EXIT_FAILURE;
+  auto thread_pool = make_unique<ThreadPool>(std::thread::hardware_concurrency());
+  unordered_map<string, piper::Voice> voice_map;
+  int counter = 0;
+
+  while (!cin.eof() && !cin.bad()) {
+    string str;
+    // cin.clear();
+    getline(cin, str, '\n');
+    if (!cin.good()) {
+      spdlog::error("Error reading request, got \"{}\"", str);
+      continue;
+    }
+    json request = json::parse(str);
+    if (!request.contains("id")) {
+      spdlog::error("Request doesn't have \"id\" member.");
+      continue;
+    }
+    auto id = request["id"].get<std::string>();
+
+    if (!request.contains("modelPath")) {
+      spdlog::error("Request doesn't have \"modelPath\" member.");
+      continue;
+    }
+    auto modelPath = request["modelPath"].get<std::string>();
+
+    if (!request.contains("inputText")) {
+      spdlog::error("Request doesn't have \"inputText\" member.");
+      continue;
+    }
+    auto inputText = request["inputText"].get<std::string>();
+
+    piper::Voice *voice = nullptr;
+    if (auto iter = voice_map.find(modelPath); iter != voice_map.end()) {
+      voice = &iter->second;
+    } else {
+      piper::Voice newVoice;
+      auto [new_iter, inserted] = voice_map.emplace(modelPath, move(newVoice));
+      voice = &new_iter->second;
+      optional<piper::SpeakerId> speakerId;
+      loadVoice(piperConfig, modelPath, modelPath + ".json", *voice, speakerId, false);
+
+      if (voice->synthesisConfig.sampleWidth != 2) {
+        spdlog::error("Expected sample width to be 2, got {}", voice->synthesisConfig.sampleWidth);
+        continue;
+      }
+    }
+
+    stringstream name;
+    name << counter++ << ".ogg";
+    auto outputName = name.str();
+
+    auto fn = [](piper::PiperConfig *config, piper::Voice *voice, string id, string inputText, string outputName) {
+      piper::SynthesisResult result;
+      vector<int16_t> audioBuffer;
+      textToAudio(*config, *voice, inputText, audioBuffer, result, NULL);
+      spdlog::info("Real-time factor: {} (infer={} sec, audio={} sec)",
+                  result.realTimeFactor, result.inferSeconds,
+                  result.audioSeconds);
+      auto output = convertWavToOgg(*voice, audioBuffer);
+
+      // TODO: if/when we multi-thread this, we'll need a lock around writing to
+      // the output.
+      if (!_isatty(_fileno(stdout))) {
+        // Write the "id" member from above back to the output, with a size-prefix.
+        uint32_t idSize = (uint32_t)id.size();
+        fwrite((const char*)&idSize, sizeof(idSize), 1, stdout);
+        fwrite(id.data(), 1, idSize, stdout);
+        spdlog::info("Wrote id \"{}\" with size {}", id, idSize);
+        // Write the output ogg as a binary blob, with a size-prefix.
+        string outputStr = output.str();
+        uint32_t outputSize = (uint32_t)outputStr.size();
+        fwrite((const char*)&outputSize, sizeof(outputSize), 1, stdout);
+        fwrite(outputStr.data(), 1, outputSize, stdout);
+        fflush(stdout);
+        spdlog::info("Wrote output of size {}", outputSize);
+      } else {
+        // Output audio to OGG file
+        ofstream audioFile(outputName, ios::binary);
+        audioFile << output.rdbuf();
+      }
+    };
+
+    // TODO: espeak-ng uses global variables so is not thread-safe. We can
+    // work around it by merging with a fork that supports a context (see
+    // https://github.com/espeak-ng/espeak-ng/issues/1527) or simpler, we can
+    // do all of the phonemization on the main thread, since the
+    // phoneme->audio conversion by onnx is thread-safe.
+    if (false) {
+      thread_pool->enqueue(move(fn), &piperConfig, voice, id, inputText, outputName);
+    } else {
+      fn(&piperConfig, voice, id, inputText, outputName);
+    }
   }
 
-  piper::SynthesisResult result;
-  std::vector<int16_t> audioBuffer;
-  textToAudio(piperConfig, voice, inputText, audioBuffer, result, NULL);
+  spdlog::info("waiting for thread pool to finish.");
+  thread_pool.reset();
+
+  spdlog::info("piper_ogg done.");
   piper::terminate(piperConfig);
+  return 0;
+}
 
-  const auto &input = audioBuffer;
+/// Copied from vorbis encoding example
+stringstream convertWavToOgg(piper::Voice &voice, const vector<int16_t> &input) {
   size_t inputOffset = 0;
-  std::stringstream output;
-
-  /// Copied from vorbis encoding example
+  stringstream output;
 
   ogg_stream_state os; /* take physical pages, weld into a logical stream of packets */
   ogg_page         og; /* one Ogg bitstream page.  Vorbis packets are inside */
@@ -73,11 +162,12 @@ int main(int argc, char *argv[]) {
 
   int eos=0, ret;
 
+  auto startTime = chrono::steady_clock::now();
   vorbis_info_init(&vi);
   ret = vorbis_encode_init_vbr(&vi, voice.synthesisConfig.channels, voice.synthesisConfig.sampleRate, .4f);
   if (ret != 0) {
-    std::cerr << "ERROR: vorbis_encode_init_vbr failed with " << ret << std::endl;
-    return EXIT_FAILURE;
+    spdlog::error("vorbis_encode_init_vbr failed with {}", ret);
+    return {};
   }
 
   vorbis_comment_init(&vc);
@@ -88,10 +178,7 @@ int main(int argc, char *argv[]) {
   vorbis_block_init(&vd, &vb);
 
   /* set up our packet->stream encoder */
-  /* pick a random serial number; that way we can more likely build
-     chained streams just by concatenation */
-  srand(time(NULL));
-  ogg_stream_init(&os, rand());
+  ogg_stream_init(&os, 0xFEEDBA6);
 
   /* Vorbis streams begin with three headers; the initial header (with
      most of the codec setup parameters) which is mandated by the Ogg
@@ -124,7 +211,7 @@ int main(int argc, char *argv[]) {
   const size_t sampleBufferSize = 1024;
   int channels = voice.synthesisConfig.channels;
   while (!eos) {
-    size_t inputEnd = std::min(inputOffset + sampleBufferSize, input.size());
+    size_t inputEnd = min(inputOffset + sampleBufferSize, input.size());
     size_t samples = inputEnd - inputOffset;
     const int16_t *readbuffer = input.data() + inputOffset;
     inputOffset += samples;
@@ -186,11 +273,8 @@ int main(int argc, char *argv[]) {
   vorbis_comment_clear(&vc);
   vorbis_info_clear(&vi);
 
-  // Output audio to OGG file
-  ofstream audioFile(outputPath, ios::binary);
-  audioFile << output.rdbuf();
+  auto endTime = chrono::steady_clock::now();
+  spdlog::info("Converted to OGG in {} second(s)", chrono::duration<double>(endTime - startTime).count());
 
-  std::cout << "OK" << std::endl;
-
-  return EXIT_SUCCESS;
+  return output;
 }
