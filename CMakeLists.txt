@@ -19,6 +19,11 @@ endif()
 
 add_executable(piper src/cpp/main.cpp src/cpp/piper.cpp)
 add_executable(test_piper src/cpp/test.cpp src/cpp/piper.cpp)
+add_executable(piper_ogg
+  src/cpp/piper_ogg.cpp
+  src/cpp/piper.cpp
+  src/cpp/minivorbis.c
+)
 
 # NOTE: external project prefix are shortened because of path length restrictions on Windows
 # NOTE: onnxruntime is pulled from piper-phonemize
@@ -39,6 +44,7 @@ if(NOT DEFINED FMT_DIR)
   )
   add_dependencies(piper fmt_external)
   add_dependencies(test_piper fmt_external)
+  add_dependencies(piper_ogg fmt_external)
 endif()
 
 # ---- spdlog ---
@@ -54,6 +60,7 @@ if(NOT DEFINED SPDLOG_DIR)
   )
   add_dependencies(piper spdlog_external)
   add_dependencies(test_piper spdlog_external)
+  add_dependencies(piper_ogg spdlog_external)
 endif()
 
 # ---- piper-phonemize ---
@@ -68,6 +75,7 @@ if(NOT DEFINED PIPER_PHONEMIZE_DIR)
   )
   add_dependencies(piper piper_phonemize_external)
   add_dependencies(test_piper piper_phonemize_external)
+  add_dependencies(piper_ogg piper_phonemize_external)
 endif()
 
 # ---- Declare executable ----
@@ -104,6 +112,31 @@ target_include_directories(piper PUBLIC
 
 target_compile_definitions(piper PUBLIC _PIPER_VERSION=${piper_version})
 
+# ---- Piper OGG
+
+target_link_libraries(piper_ogg
+  fmt
+  spdlog
+  espeak-ng
+  piper_phonemize
+  onnxruntime
+  ${PIPER_EXTRA_LIBRARIES}
+)
+
+target_link_directories(piper_ogg PUBLIC
+  ${FMT_DIR}/lib
+  ${SPDLOG_DIR}/lib
+  ${PIPER_PHONEMIZE_DIR}/lib
+)
+
+target_include_directories(piper_ogg PUBLIC
+  ${FMT_DIR}/include
+  ${SPDLOG_DIR}/include
+  ${PIPER_PHONEMIZE_DIR}/include
+)
+
+target_compile_definitions(piper_ogg PUBLIC _PIPER_VERSION=${piper_version})
+
 # ---- Declare test ----
 include(CTest)
 enable_testing()
@@ -139,7 +172,7 @@ target_link_libraries(test_piper PUBLIC
 # ---- Declare install targets ----
 
 install(
-  TARGETS piper
+  TARGETS piper piper_ogg
   DESTINATION ${CMAKE_INSTALL_PREFIX})
 
 # Dependencies
