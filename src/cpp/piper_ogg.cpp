@@ -62,7 +62,7 @@ int main(int argc, char *argv[]) {
       spdlog::error("Request doesn't have \"id\" member.");
       continue;
     }
-    auto id = request["id"].get<std::string>();
+    auto id = request["id"].get<uint32_t>();
 
     if (!request.contains("modelPath")) {
       spdlog::error("Request doesn't have \"modelPath\" member.");
@@ -96,7 +96,7 @@ int main(int argc, char *argv[]) {
     name << counter++ << ".ogg";
     auto outputName = name.str();
 
-    auto fn = [](piper::PiperConfig *config, piper::Voice *voice, string id, string inputText, string outputName) {
+    auto fn = [](piper::PiperConfig *config, piper::Voice *voice, uint32_t id, string inputText, string outputName) {
       piper::SynthesisResult result;
       vector<int16_t> audioBuffer;
       textToAudio(*config, *voice, inputText, audioBuffer, result, NULL);
@@ -108,15 +108,21 @@ int main(int argc, char *argv[]) {
       // TODO: if/when we multi-thread this, we'll need a lock around writing to
       // the output.
       if (!_isatty(_fileno(stdout))) {
-        // Write the "id" member from above back to the output, with a size-prefix.
-        uint32_t idSize = (uint32_t)id.size();
-        fwrite((const char*)&idSize, sizeof(idSize), 1, stdout);
-        fwrite(id.data(), 1, idSize, stdout);
-        spdlog::info("Wrote id \"{}\" with size {}", id, idSize);
-        // Write the output ogg as a binary blob, with a size-prefix.
+        // Write the following data:
+        //   output_size: 4 bytes
+        //   id:          4 bytes
+        //   output:      `output_size` bytes
+
         string outputStr = output.str();
         uint32_t outputSize = (uint32_t)outputStr.size();
+
+        // Write size of the ogg binary data.
         fwrite((const char*)&outputSize, sizeof(outputSize), 1, stdout);
+        spdlog::info("Wrote output size {}", outputSize);
+        // Write the "id" member from above back to the output, with a size-prefix.
+        fwrite((const char*)&id, sizeof(id), 1, stdout);
+        spdlog::info("Wrote id {}", id);
+        // Write the output ogg as a binary blob.
         fwrite(outputStr.data(), 1, outputSize, stdout);
         fflush(stdout);
         spdlog::info("Wrote output of size {}", outputSize);
