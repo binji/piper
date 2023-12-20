@@ -40,6 +40,7 @@ int main(int argc, char *argv[]) {
     spdlog::info("Setting stdout to binary mode");
     fflush(stdout);
     _setmode(_fileno(stdout), _O_BINARY);
+    FreeConsole();
   }
 
   piperConfig.eSpeakDataPath = string(argv[1]);
