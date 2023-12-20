@@ -6,6 +6,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -20,10 +21,13 @@
 #include "piper.hpp"
 #include "minivorbis.h"
 #include "ThreadPool.h"
+#include "signalsmith/signalsmith-stretch.h"
 
 using namespace std;
 using json = nlohmann::json;
+using namespace signalsmith::stretch;
 
+vector<int16_t> processWav(piper::Voice &voice, const vector<int16_t> &input, float transposeFactor, float timeStretchFactor);
 stringstream convertWavToOgg(piper::Voice &voice, const vector<int16_t> &input);
 void processInput(string& inputText);
 
@@ -78,6 +82,16 @@ int main(int argc, char *argv[]) {
     }
     auto inputText = request["inputText"].get<std::string>();
 
+    auto transposeFactor = 1.0f;
+    if (request.contains("transposeFactor")) {
+      transposeFactor = request["transposeFactor"].get<float>();
+    }
+
+    auto timeStretchFactor = 1.0f;
+    if (request.contains("timeStretchFactor")) {
+      timeStretchFactor = request["timeStretchFactor"].get<float>();
+    }
+
     piper::Voice *voice = nullptr;
     if (auto iter = voice_map.find(modelPath); iter != voice_map.end()) {
       voice = &iter->second;
@@ -104,13 +118,14 @@ int main(int argc, char *argv[]) {
       spdlog::info("Changed text from \"{}\" to \"{}\"", oldInputText, inputText);
     }
 
-    auto fn = [](piper::PiperConfig *config, piper::Voice *voice, uint32_t id, string inputText, string outputName) {
+    auto fn = [](piper::PiperConfig *config, piper::Voice *voice, uint32_t id, string inputText, string outputName, float transposeFactor, float timeStretchFactor) {
       piper::SynthesisResult result;
       vector<int16_t> audioBuffer;
       textToAudio(*config, *voice, inputText, audioBuffer, result, NULL);
       spdlog::info("Real-time factor: {} (infer={} sec, audio={} sec)",
                   result.realTimeFactor, result.inferSeconds,
                   result.audioSeconds);
+      audioBuffer = processWav(*voice, audioBuffer, transposeFactor, timeStretchFactor);
       auto output = convertWavToOgg(*voice, audioBuffer);
 
       // TODO: if/when we multi-thread this, we'll need a lock around writing to
@@ -147,9 +162,9 @@ int main(int argc, char *argv[]) {
     // do all of the phonemization on the main thread, since the
     // phoneme->audio conversion by onnx is thread-safe.
     if (false) {
-      thread_pool->enqueue(move(fn), &piperConfig, voice, id, inputText, outputName);
+      thread_pool->enqueue(move(fn), &piperConfig, voice, id, inputText, outputName, transposeFactor, timeStretchFactor);
     } else {
-      fn(&piperConfig, voice, id, inputText, outputName);
+      fn(&piperConfig, voice, id, inputText, outputName, transposeFactor, timeStretchFactor);
     }
   }
 
@@ -159,6 +174,64 @@ int main(int argc, char *argv[]) {
   spdlog::info("piper_ogg done.");
   piper::terminate(piperConfig);
   return 0;
+}
+
+struct SampleChannel {
+  float *samples;
+  int channel_count;
+  int ch;
+
+  float &operator[](size_t index) { return samples[index * channel_count + ch]; }
+  const float &operator[](size_t index) const{ return samples[index * channel_count + ch]; }
+};
+
+struct SampleBuffer {
+  float *samples;
+  int channel_count;
+
+  SampleChannel operator[](int channel) {
+    return SampleChannel { samples, channel_count, channel };
+  }
+  SampleChannel operator[](int channel) const {
+    return SampleChannel { samples, channel_count, channel };
+  }
+};
+
+vector<int16_t> processWav(piper::Voice &voice, const vector<int16_t> &inputInterleaved, float transposeFactor, float timeStretchFactor) {
+  SignalsmithStretch stretch;
+  auto channels = voice.synthesisConfig.channels;
+  stretch.presetDefault(channels, voice.synthesisConfig.sampleRate);
+  stretch.setTransposeFactor(transposeFactor);
+  size_t inputSamples = inputInterleaved.size() / channels;
+  size_t outputSamples = size_t((inputSamples * channels * timeStretchFactor + channels - 1) / channels);
+
+  const auto fi16min = float(numeric_limits<int16_t>::min());
+  const auto fi16max = float(numeric_limits<int16_t>::max());
+
+  // Create input buffer and copy+convert samples from int16_t -> float.
+  auto inputBuffer = make_unique<float[]>(inputSamples * channels);
+  auto input = SampleBuffer { inputBuffer.get(), channels };
+  for (int i = 0; i < inputSamples; ++i) {
+    for (int c = 0; c < channels; ++c) {
+      input[c][i] = inputInterleaved[i * channels + c] / fi16max;
+    }
+  }
+
+  // Process samples.
+  auto outputBuffer = make_unique<float[]>(outputSamples * channels);
+  auto output = SampleBuffer { outputBuffer.get(), channels };
+  spdlog::info("Converting {} samples to {} samples, with a transpose factor of {}", inputSamples, outputSamples, transposeFactor);
+  stretch.process(input, inputSamples, output, outputSamples);
+
+  // Convert output from float -> int16_t.
+  vector<int16_t> outputInterleaved;
+  for (int i = 0; i < outputSamples; ++i) {
+    for (int c = 0; c < channels; ++c) {
+      outputInterleaved.push_back(int16_t(clamp(output[c][i] * fi16max, fi16min, fi16max)));
+    }
+  }
+
+  return outputInterleaved;
 }
 
 void replaceAll(string& inputText, const string& source, const string& dest) {
