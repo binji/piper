@@ -25,6 +25,7 @@ using namespace std;
 using json = nlohmann::json;
 
 stringstream convertWavToOgg(piper::Voice &voice, const vector<int16_t> &input);
+void processInput(string& inputText);
 
 int main(int argc, char *argv[]) {
   spdlog::set_default_logger(spdlog::stderr_color_mt("piper_ogg"));
@@ -97,6 +98,12 @@ int main(int argc, char *argv[]) {
     name << counter++ << ".ogg";
     auto outputName = name.str();
 
+    string oldInputText = inputText;
+    processInput(inputText);
+    if (oldInputText != inputText) {
+      spdlog::info("Changed text from \"{}\" to \"{}\"", oldInputText, inputText);
+    }
+
     auto fn = [](piper::PiperConfig *config, piper::Voice *voice, uint32_t id, string inputText, string outputName) {
       piper::SynthesisResult result;
       vector<int16_t> audioBuffer;
@@ -152,6 +159,24 @@ int main(int argc, char *argv[]) {
   spdlog::info("piper_ogg done.");
   piper::terminate(piperConfig);
   return 0;
+}
+
+void replaceAll(string& inputText, const string& source, const string& dest) {
+  size_t pos = string::npos;
+  while (true) {
+    auto found = inputText.rfind(source, pos);
+    if (found == string::npos) break;
+    inputText.replace(found, source.size(), dest);
+    if (found == 0) break;
+    pos = found - 1;
+  }
+}
+
+void processInput(string& inputText) {
+  // Change ".." and "..." to ";" in the input text. ".." isn't parsed properly,
+  // and "..." doesn't pause, but ";" does.
+  replaceAll(inputText, "...", ";");
+  replaceAll(inputText, "..", ";");
 }
 
 /// Copied from vorbis encoding example
